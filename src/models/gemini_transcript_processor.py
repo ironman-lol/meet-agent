@@ -1,332 +1,197 @@
-import google.generativeai as genai
-from datetime import datetime
-from typing import Dict, List
+import os
 import re
 import json
-import os
+from datetime import datetime
+from typing import Dict, List, Any
+import google.generativeai as genai
 from src.utils.config import get_settings
+
+MODEL_NAME = "gemini-2.5-flash-lite"
 
 settings = get_settings()
 
 class GeminiTranscriptProcessor:
+    """
+    Minimal, pragmatic transcript processor that uses a hardcoded low-cost model.
+    Removed model discovery, scoring, and startup verification to keep code direct.
+    """
+
     def __init__(self):
-        # Check for API key
         api_key = settings.GOOGLE_API_KEY
         if not api_key or api_key == "your_google_api_key_here":
             raise ValueError("Please set a valid Google API key in the .env file")
-            
+
         genai.configure(api_key=api_key)
-
-        # Check for manually specified model
-        selected_model = os.getenv("SELECTED_MODEL")
-        if selected_model:
-            print(f"Using manually specified model: {selected_model}")
-            self.model = genai.GenerativeModel(selected_model)
-            return
-
-        # List and analyze available models
-        available_models = list(genai.list_models())  # Convert generator to list
-        print("Available models count:", len(available_models))
-
-        def is_text_gen_model(m):
-            # get supported_generation_methods field (exists on Model)
-            methods = None
-            try:
-                methods = getattr(m, "supported_generation_methods", None)
-                if methods is None and isinstance(m, dict):
-                    methods = m.get("supported_generation_methods")
-            except Exception:
-                methods = None
-
-            # normalize to list of lowercase strings
-            if not methods:
-                return False
-            methods_lc = [str(x).lower() for x in methods]
-
-            # exclude embed-only / image-only / predict-only markers
-            if any(x in methods_lc for x in ("embedcontent","embed","predict")):
-                return False
-
-            # accept if it supports any known generation method
-            accept_markers = ("generatecontent", "bidigeneratecontent", "createcachedcontent", "batchgeneratecontent", "generateanswer")
-            return any(mk in methods_lc for mk in accept_markers)
-
-        # collect candidates and ensure we have a list
+        # instantiate model object (SDK may accept name string or GenerativeModel wrapper)
         try:
-            text_models = [m for m in available_models if is_text_gen_model(m)]
-        except TypeError:  # If available_models is still a generator somehow
-            available_models = list(available_models)
-            text_models = [m for m in available_models if is_text_gen_model(m)]
+            self.model = genai.GenerativeModel(MODEL_NAME)
+        except Exception:
+            # fallback: keep model name and call top-level helpers
+            self.model = None
 
-        if not text_models:
-            # dump signatures for debugging
-            print("\nDumping all available models for debugging:")
-            for m in available_models:
-                try:
-                    sig = {
-                        "name": getattr(m, "name", None),
-                        "display_name": getattr(m, "display_name", None),
-                        "supported_generation_methods": getattr(m, "supported_generation_methods", None)
-                    }
-                    print(f"MODEL SIGNATURE: {sig}")
-                    print(f"Raw supported_generation_methods: {getattr(m, 'supported_generation_methods', None)}")
-                except Exception as e:
-                    print(f"MODEL RAW ({type(m)}): {repr(m)}")
-                    print(f"Error getting signature: {str(e)}")
-            raise RuntimeError("No text generation models found. See signatures above.")
-
-        # prefer Gemini by name, else pick first
-        def name_of(m):
-            return getattr(m, "name", None) or (m.get("name") if isinstance(m, dict) else None)
-
-        gemini = [m for m in text_models if "gemini" in (name_of(m) or "").lower()]
-        chosen = gemini[0] if gemini else text_models[0]
-        model_name = name_of(chosen)
-        print("Selected model:", model_name)
-
-        # instantiate generative model (use name/id as SDK expects)
-        self.model = genai.GenerativeModel(model_name)
-
-        # conservative verification: try multiple call patterns
-        test_prompt = "Say: hello"
-        test_response = None
-        errors = []
-
-        # try model.generate_content (SDK usually exposes snake_case)
-        try:
-            fn = getattr(self.model, "generate_content", None)
-            if callable(fn):
-                test_response = fn(test_prompt)
-        except Exception as e:
-            errors.append(("generate_content", str(e)))
-
-        # try bidiGenerate variant if available on model (some models are bidi)
-        if not test_response:
-            try:
-                fn = getattr(self.model, "bidi_generate_content", None) or getattr(self.model, "bidiGenerateContent", None)
-                if callable(fn):
-                    test_response = fn(test_prompt)
-            except Exception as e:
-                errors.append(("bidi_generate", str(e)))
-
-        # try top-level helper if present (alternative SDK helper)
-        if not test_response:
-            try:
-                # genai.generate_text signature may vary; adapt if your SDK exposes it
-                if hasattr(genai, "generate_text"):
-                    test_response = genai.generate_text(model=model_name, input=test_prompt)
-            except Exception as e:
-                errors.append(("genai.generate_text", str(e)))
-
-        # validate shape
-        if not test_response:
-            print("Model verification failed. Attempted calls:", errors)
-            raise RuntimeError("Model verification failed; check SDK method names and that the API key has text-gen access.")
-
-        # if response object uses .text or content field, adapt when parsing later
-        print("Model verification succeeded. Response repr:", repr(test_response))
-        
-        # Model initialization is handled in the try-except block above
-            
+        self.model_name = MODEL_NAME
         self.time_pattern = r'\[(\d{2}:\d{2}:\d{2})\]'
-        self.speaker_pattern = r'\[(.*?)\].*?:(.*)'
+        self.speaker_pattern = r'^\s*\[(\d{2}:\d{2}:\d{2})\]\s*(.*?):\s*(.*)$'
 
-    def process_transcript(self, transcript: str) -> Dict:
-        """
-        Process the entire transcript and return comprehensive analysis.
-        """
-        messages = self.extract_messages(transcript)
-        
-        # Get AI-powered analysis
-        summary = self.generate_summary(messages)
-        action_items = self.extract_action_items(messages)
-        meeting_requests = self.extract_meeting_requests(messages)
-        key_decisions = self.extract_key_decisions(messages)
-        
-        return {
-            "summary": summary,
-            "action_items": action_items,
-            "meeting_requests": meeting_requests,
-            "key_decisions": key_decisions,
-            "participants": list(set(msg["speaker"] for msg in messages)),
-            "duration": self._calculate_duration(messages)
-        }
-
-    def extract_messages(self, transcript: str) -> List[Dict]:
-        """
-        Extract messages from the transcript with timestamp and speaker information.
-        """
-        messages = []
-        for line in transcript.split('\n'):
+    # -------- transcript parsing --------
+    def extract_messages(self, transcript: str) -> List[Dict[str, str]]:
+        msgs: List[Dict[str, str]] = []
+        for line in transcript.splitlines():
             if not line.strip():
                 continue
-                
-            # Extract timestamp - pattern: [HH:MM:SS]
-            time_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-            if not time_match:
+            m = re.match(self.speaker_pattern, line)
+            if m:
+                ts, speaker, content = m.groups()
+                msgs.append({"timestamp": ts, "speaker": speaker.strip(), "content": content.strip()})
                 continue
-                
-            timestamp = time_match.group(1)
-            
-            # Remove timestamp from line and extract speaker and content
-            remaining_text = line[line.find(']') + 1:].strip()
-            if ':' not in remaining_text:
+            # fallback: find [HH:MM:SS] then split on first colon
+            tmatch = re.search(self.time_pattern, line)
+            if not tmatch:
                 continue
-                
-            speaker, content = remaining_text.split(':', 1)
-            
-            messages.append({
-                "timestamp": timestamp,
-                "speaker": speaker.strip(),
-                "content": content.strip()
-            })
-        
-        return messages
+            ts = tmatch.group(1)
+            rest = line[line.find("]") + 1 :].strip()
+            if ":" in rest:
+                speaker, content = rest.split(":", 1)
+                msgs.append({"timestamp": ts, "speaker": speaker.strip(), "content": content.strip()})
+        return msgs
 
-    def generate_summary(self, messages: List[Dict]) -> Dict:
-        """
-        Generate an AI-powered summary of the meeting.
-        """
-        print("Generating meeting summary...")
-        conversation = "\n".join([f"{msg['speaker']}: {msg['content']}" for msg in messages])
-        print(f"Prepared conversation text: {len(conversation)} characters")
-        
-        prompt = """
-        Analyze the following meeting transcript and provide:
-        1. A concise summary (2-3 paragraphs)
-        2. List of main topics discussed
-        3. Key points highlighted
-        
-        Format your response as a JSON object with these keys:
-        {
-            "summary": "your summary here",
-            "main_topics": ["topic 1", "topic 2", ...],
-            "key_points": ["point 1", "point 2", ...]
+    # -------- model call helper (tries best-available call) --------
+    def _call_model(self, prompt: str) -> str:
+        # Prefer instance method if model wrapper exists
+        if self.model:
+            for method in ("generate_content", "generate_text", "create_text", "generate"):
+                fn = getattr(self.model, method, None)
+                if callable(fn):
+                    try:
+                        resp = fn(prompt)
+                        if hasattr(resp, "text"):
+                            return resp.text
+                        if hasattr(resp, "content"):
+                            return resp.content
+                        if isinstance(resp, dict):
+                            for k in ("content", "text", "output"):
+                                if k in resp:
+                                    return resp[k]
+                            return json.dumps(resp)
+                        if isinstance(resp, str):
+                            return resp
+                    except Exception:
+                        # don't raise here; try other options
+                        pass
+
+        # Top-level helper fallback
+        for helper in ("generate_text", "generate", "create_text"):
+            fn = getattr(genai, helper, None)
+            if callable(fn):
+                try:
+                    resp = fn(model=self.model_name, input=prompt)
+                    if hasattr(resp, "text"):
+                        return resp.text
+                    if isinstance(resp, dict):
+                        for k in ("content", "text", "output"):
+                            if k in resp:
+                                return resp[k]
+                        return json.dumps(resp)
+                    if isinstance(resp, str):
+                        return resp
+                except Exception:
+                    pass
+
+        # Final fallback: return empty string (caller should handle)
+        return ""
+
+    # -------- extractors that ask the model --------
+    def generate_summary(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        convo = "\n".join(f"{m['speaker']}: {m['content']}" for m in messages)
+        prompt = (
+            "Analyze the following meeting transcript and provide:\n"
+            "1) A concise summary (2-3 paragraphs)\n"
+            "2) A list of main topics\n"
+            "3) Key points\n\n"
+            "Return JSON object with keys: summary, main_topics, key_points\n\n"
+            "Transcript:\n" + convo
+        )
+        raw = self._call_model(prompt)
+        # try robust JSON extraction
+        try:
+            start = raw.find('{')
+            end = raw.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start:end+1])
+        except Exception:
+            pass
+        return {"summary": raw.strip(), "main_topics": [], "key_points": []}
+
+    def extract_action_items(self, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        convo = "\n".join(f"{m['speaker']}: {m['content']}" for m in messages)
+        prompt = (
+            "Find action items in this transcript. For each: assignee, task, deadline (or null), context.\n"
+            "Return a JSON array of objects.\n\nTranscript:\n" + convo
+        )
+        raw = self._call_model(prompt)
+        try:
+            start = raw.find('[')
+            end = raw.rfind(']')
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start:end+1])
+        except Exception:
+            pass
+        return []
+
+    def extract_meeting_requests(self, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        convo = "\n".join(f"{m['speaker']}: {m['content']}" for m in messages)
+        prompt = (
+            "List meeting/scheduling requests found. For each: requester, proposed_time, participants, purpose.\n"
+            "Return JSON array.\n\nTranscript:\n" + convo
+        )
+        raw = self._call_model(prompt)
+        try:
+            start = raw.find('[')
+            end = raw.rfind(']')
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start:end+1])
+        except Exception:
+            pass
+        return []
+
+    def extract_key_decisions(self, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        convo = "\n".join(f"{m['speaker']}: {m['content']}" for m in messages)
+        prompt = (
+            "Identify key decisions. For each: decision, decision_maker, rationale. Return JSON array.\n\nTranscript:\n" + convo
+        )
+        raw = self._call_model(prompt)
+        try:
+            start = raw.find('[')
+            end = raw.rfind(']')
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start:end+1])
+        except Exception:
+            pass
+        return []
+
+    # -------- high-level processing --------
+    def process_transcript(self, transcript: str) -> Dict[str, Any]:
+        messages = self.extract_messages(transcript)
+        return {
+            "summary": self.generate_summary(messages),
+            "action_items": self.extract_action_items(messages),
+            "meeting_requests": self.extract_meeting_requests(messages),
+            "key_decisions": self.extract_key_decisions(messages),
+            "participants": sorted({m["speaker"] for m in messages}),
+            "duration": self._calculate_duration(messages),
         }
 
-        Meeting Transcript:
-        """ + conversation
-
-        response = self.model.generate_content(prompt)
-        # Extract JSON from response
-        try:
-            json_str = response.text[response.text.find('{'):response.text.rfind('}')+1]
-            return json.loads(json_str)
-        except:
-            # Fallback structure if JSON parsing fails
-            return {
-                "summary": response.text,
-                "main_topics": [],
-                "key_points": []
-            }
-
-    def extract_action_items(self, messages: List[Dict]) -> List[Dict]:
-        """
-        Extract action items using Gemini.
-        """
-        conversation = "\n".join([f"{msg['speaker']}: {msg['content']}" for msg in messages])
-        
-        prompt = """
-        Analyze this meeting transcript and identify all action items. For each action item, provide:
-        1. Who is responsible
-        2. What needs to be done
-        3. Any mentioned deadlines
-
-        Format your response as a JSON array of objects:
-        [
-            {
-                "assignee": "person name",
-                "task": "what needs to be done",
-                "deadline": "mentioned deadline or null",
-                "context": "relevant context"
-            }
-        ]
-
-        Meeting Transcript:
-        """ + conversation
-
-        response = self.model.generate_content(prompt)
-        try:
-            json_str = response.text[response.text.find('['):response.text.rfind(']')+1]
-            return json.loads(json_str)
-        except:
-            return []
-
-    def extract_meeting_requests(self, messages: List[Dict]) -> List[Dict]:
-        """
-        Extract meeting requests using Gemini.
-        """
-        conversation = "\n".join([f"{msg['speaker']}: {msg['content']}" for msg in messages])
-        
-        prompt = """
-        Analyze this conversation for any mentions of future meetings or scheduling requests.
-        For each meeting request, identify:
-        1. Who requested the meeting
-        2. Proposed time/date
-        3. Suggested participants
-        4. Meeting purpose
-
-        Format your response as a JSON array of objects:
-        [
-            {
-                "requester": "person name",
-                "proposed_time": "mentioned time",
-                "participants": ["person1", "person2"],
-                "purpose": "meeting purpose"
-            }
-        ]
-
-        Meeting Transcript:
-        """ + conversation
-
-        response = self.model.generate_content(prompt)
-        try:
-            json_str = response.text[response.text.find('['):response.text.rfind(']')+1]
-            return json.loads(json_str)
-        except:
-            return []
-
-    def extract_key_decisions(self, messages: List[Dict]) -> List[Dict]:
-        """
-        Extract key decisions using Gemini.
-        """
-        conversation = "\n".join([f"{msg['speaker']}: {msg['content']}" for msg in messages])
-        
-        prompt = """
-        Analyze this conversation and identify key decisions made during the meeting.
-        For each decision, provide:
-        1. What was decided
-        2. Who made or approved the decision
-        3. Any context or rationale provided
-
-        Format your response as a JSON array of objects:
-        [
-            {
-                "decision": "what was decided",
-                "decision_maker": "who made the decision",
-                "rationale": "context or reasoning"
-            }
-        ]
-
-        Meeting Transcript:
-        """ + conversation
-
-        response = self.model.generate_content(prompt)
-        try:
-            json_str = response.text[response.text.find('['):response.text.rfind(']')+1]
-            return json.loads(json_str)
-        except:
-            return []
-
-    def _calculate_duration(self, messages: List[Dict]) -> str:
-        """
-        Calculate the duration of the meeting.
-        """
+    def _calculate_duration(self, messages: List[Dict[str, str]]) -> str:
         if not messages:
             return "0:00"
-            
-        start = datetime.strptime(messages[0]["timestamp"], "%H:%M:%S")
-        end = datetime.strptime(messages[-1]["timestamp"], "%H:%M:%S")
-        duration = end - start
-        
-        return str(duration)
+        try:
+            start = datetime.strptime(messages[0]["timestamp"], "%H:%M:%S")
+            end = datetime.strptime(messages[-1]["timestamp"], "%H:%M:%S")
+            delta = end - start
+            if delta.total_seconds() < 0:
+                return "0:00"
+            minutes = int(delta.total_seconds() // 60)
+            seconds = int(delta.total_seconds() % 60)
+            return f"{minutes}:{seconds:02d}"
+        except Exception:
+            return "0:00"
