@@ -1,175 +1,180 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from src.models.gemini_transcript_processor import GeminiTranscriptProcessor
 import google.generativeai as genai
 from src.utils.config import get_settings
+import os
+import json
 
 settings = get_settings()
+
+# Hardcode the low-cost text model
+MODEL_NAME = "gemini-2.5-flash-lite"
 
 class ChatHandler:
     def __init__(self):
         print("Initializing ChatHandler...")
-        # Initialize basic properties first
         self.messages: List[Dict[str, str]] = []
-        self.current_transcript = None
-        self.current_analysis = None
-        
+        self.current_transcript: Optional[str] = None
+        self.current_analysis: Optional[Dict[str, Any]] = None
+
+        # Configure API key
+        api_key = settings.GOOGLE_API_KEY
+        if not api_key or api_key == "your_google_api_key_here":
+            raise ValueError("Please set a valid Google API key in the .env file")
+        genai.configure(api_key=api_key)
+
+        # Instantiate model wrapper if SDK supports it; otherwise keep model_name and use top-level helpers.
         try:
-            genai.configure(api_key=settings.GOOGLE_API_KEY)
-            self.model = genai.GenerativeModel('gemini-pro')
-            print("Gemini model initialized")
-            
-            self.transcript_processor = GeminiTranscriptProcessor()
-            print("Transcript processor initialized")
-            
-            # Load and process sample transcript automatically
-            print("Loading sample transcript...")
-            with open('/workspaces/meet-agent/sample_transcript1.txt', 'r') as f:
-                sample_transcript = f.read()
+            self.model = genai.GenerativeModel(MODEL_NAME)
+        except Exception:
+            self.model = None
+        self.model_name = MODEL_NAME
+
+        # Initialize transcript processor (kept unchanged)
+        self.transcript_processor = GeminiTranscriptProcessor()
+
+        # Try to load and automatically process sample transcript if it exists
+        sample_path = "/workspaces/meet-agent/sample_transcript1.txt"
+        if os.path.exists(sample_path):
+            try:
+                with open(sample_path, "r", encoding="utf-8") as f:
+                    sample_transcript = f.read()
                 print(f"Sample transcript loaded: {len(sample_transcript)} characters")
                 self.process_transcript(sample_transcript)
-                
-                # Add initial welcome message
                 welcome_msg = (
-                    "👋 Welcome! I've analyzed the technical architecture meeting transcript. Here are the key points:\n\n"
-                    f"📝 {self.current_analysis['summary']['summary']}\n\n"
-                    "I can help you with:\n"
-                    "1. 📅 Scheduling follow-up meetings mentioned\n"
-                    "2. 📋 Creating Notion pages for tasks and decisions\n"
-                    "3. 🔍 Answering questions about specific topics\n"
-                    "4. 📊 Providing more details about any discussion point\n\n"
-                    "What would you like to know more about?"
+                    "Welcome. Transcript processed. Ask about summary, action items, meeting requests, or key decisions."
                 )
                 self.add_message(welcome_msg, role="assistant")
-        except Exception as e:
-            print(f"Error initializing ChatHandler: {str(e)}")
-            self.add_message(
-                "👋 Welcome! I'm ready to help you analyze meeting transcripts. "
-                "There was an issue loading the sample transcript, but you can ask me questions "
-                "once a transcript is processed.",
-                role="assistant"
-            )
+            except Exception as e:
+                print(f"Failed to load/process sample transcript: {e}")
+                self.add_message(
+                    "Welcome. Ready to analyze transcripts. Failed to auto-load sample transcript.",
+                    role="assistant"
+                )
+        else:
+            self.add_message("Welcome. Ready to analyze transcripts.", role="assistant")
 
     def add_message(self, content: str, role: str = "user"):
-        """Add a message to the conversation history."""
         self.messages.append({"role": role, "content": content})
 
     def get_messages(self) -> List[Dict[str, str]]:
-        """Get all messages in the conversation."""
         return self.messages
 
-    def process_transcript(self, transcript_text: str) -> Dict:
-        """Process a transcript and store the analysis."""
+    def _call_model(self, prompt: str) -> str:
+        """
+        Minimal robust caller: prefer instance methods if available, then top-level helpers.
+        Returns string (possibly empty) and never raises.
+        """
+        # Instance-level attempts
+        if self.model:
+            for method in ("generate_content", "generate_text", "create_text", "generate"):
+                fn = getattr(self.model, method, None)
+                if callable(fn):
+                    try:
+                        resp = fn(prompt)
+                        if hasattr(resp, "text"):
+                            return resp.text
+                        if hasattr(resp, "content"):
+                            return resp.content
+                        if isinstance(resp, dict):
+                            for k in ("content", "text", "output"):
+                                if k in resp:
+                                    return resp[k]
+                            return json.dumps(resp)
+                        if isinstance(resp, str):
+                            return resp
+                    except Exception:
+                        # swallow and try next
+                        pass
+
+        # Top-level helper fallback
+        for helper in ("generate_text", "generate", "create_text"):
+            fn = getattr(genai, helper, None)
+            if callable(fn):
+                try:
+                    resp = fn(model=self.model_name, input=prompt)
+                    if hasattr(resp, "text"):
+                        return resp.text
+                    if isinstance(resp, dict):
+                        for k in ("content", "text", "output"):
+                            if k in resp:
+                                return resp[k]
+                        return json.dumps(resp)
+                    if isinstance(resp, str):
+                        return resp
+                except Exception:
+                    pass
+
+        # Final fallback: empty string
+        return ""
+
+    def process_transcript(self, transcript_text: str) -> Dict[str, Any]:
         try:
             print(f"Processing transcript of length: {len(transcript_text)}")
             self.current_transcript = transcript_text
-            print("Starting transcript analysis...")
             self.current_analysis = self.transcript_processor.process_transcript(transcript_text)
-            print("Transcript analysis completed")
-            
-            # Add a summary message to the chat
-            if isinstance(self.current_analysis, dict) and 'summary' in self.current_analysis:
-                summary = (
-                    "📄 I've analyzed the transcript. Here's a summary:\n\n"
-                    f"{self.current_analysis['summary']['summary']}\n\n"
-                    "You can ask me about:\n"
-                    "- Action items\n"
-                    "- Meeting requests\n"
-                    "- Key decisions\n"
-                    "- Specific topics discussed"
+
+            # Add concise assistant summary message
+            if isinstance(self.current_analysis, dict) and "summary" in self.current_analysis:
+                summary_text = self.current_analysis["summary"].get("summary") if isinstance(self.current_analysis["summary"], dict) else str(self.current_analysis["summary"])
+                assistant_msg = (
+                    "Transcript analyzed. Summary:\n\n" + (summary_text or "No summary generated.")
                 )
             else:
-                summary = "I've processed the transcript but encountered an issue generating the summary. You can still ask me questions about the content."
-            
-            self.add_message(summary, role="assistant")
-            return self.current_analysis
+                assistant_msg = "Transcript analyzed. Summary not available."
+
+            self.add_message(assistant_msg, role="assistant")
+            return self.current_analysis or {}
         except Exception as e:
-            error_msg = f"Error processing transcript: {str(e)}"
-            print(error_msg)
-            self.add_message(
-                "I encountered an error while processing the transcript.\n\n"
-                f"Error details: {str(e)}\n\n"
-                "Please make sure:\n"
-                "1. The transcript follows the format: [HH:MM:SS] Speaker: Message\n"
-                "2. The Google API key is properly configured\n"
-                "3. The transcript file is accessible",
-                role="assistant"
-            )
+            print(f"Error processing transcript: {e}")
+            self.add_message(f"Error processing transcript: {e}", role="assistant")
             return {}
 
     async def get_response(self, user_message: str) -> str:
-        """Get a response to a user message."""
         if not self.current_analysis:
-            return "Please upload a transcript first so I can help you better."
+            return "Upload or provide a transcript first."
 
-        # Create a context-aware prompt based on common user intents
-        if any(word in user_message.lower() for word in ['schedule', 'meeting', 'calendar', 'when']):
-            prompt = f"""
-            Based on the meeting transcript where:
-            Meeting Requests: {self.current_analysis['meeting_requests']}
-            
-            The user asks: {user_message}
-            
-            If there are relevant meeting requests, suggest scheduling them and provide details.
-            Format the response in a friendly way, including:
-            1. The purpose of the meeting
-            2. Suggested attendees
-            3. Proposed time/date
-            4. Any context from the discussion
-            
-            If you suggest scheduling, end with: "Would you like me to schedule this meeting?"
-            """
-        elif any(word in user_message.lower() for word in ['task', 'action', 'todo', 'assignment']):
-            prompt = f"""
-            Based on the meeting transcript where:
-            Action Items: {self.current_analysis['action_items']}
-            
-            The user asks: {user_message}
-            
-            List relevant action items, including:
-            1. Who is responsible
-            2. What needs to be done
-            3. Any deadlines mentioned
-            4. Related context
-            
-            If there are tasks to track, end with: "Would you like me to create a Notion page to track these tasks?"
-            """
-        elif any(word in user_message.lower() for word in ['decide', 'decision', 'agreed', 'conclusion']):
-            prompt = f"""
-            Based on the meeting transcript where:
-            Key Decisions: {self.current_analysis['key_decisions']}
-            
-            The user asks: {user_message}
-            
-            Explain the relevant decisions, including:
-            1. What was decided
-            2. Who made/approved the decision
-            3. The rationale behind it
-            4. Any implementation details discussed
-            
-            If there are important decisions, end with: "Would you like me to document these decisions in Notion?"
-            """
+        user_lower = user_message.lower()
+        # Build a compact context prompt
+        context = {
+            "summary": self.current_analysis.get("summary"),
+            "action_items": self.current_analysis.get("action_items"),
+            "meeting_requests": self.current_analysis.get("meeting_requests"),
+            "key_decisions": self.current_analysis.get("key_decisions"),
+        }
+        # Choose intent-driven prompt templates
+        if any(k in user_lower for k in ("schedule", "meeting", "calendar", "when")):
+            prompt = (
+                f"Using the meeting requests below, suggest scheduling details.\n\nMeeting Requests:\n{json.dumps(context['meeting_requests'])}\n\nUser question: {user_message}\n\n"
+                "Return a concise suggestion with purpose, attendees, proposed time/date, and context."
+            )
+        elif any(k in user_lower for k in ("task", "action", "todo", "assignment")):
+            prompt = (
+                f"Using the action items below, list relevant tasks for the user.\n\nAction Items:\n{json.dumps(context['action_items'])}\n\nUser question: {user_message}\n\n"
+                "Return a concise list of tasks with assignees and deadlines."
+            )
+        elif any(k in user_lower for k in ("decide", "decision", "agreed", "conclusion")):
+            prompt = (
+                f"Using the key decisions below, explain decisions relevant to the user.\n\nKey Decisions:\n{json.dumps(context['key_decisions'])}\n\nUser question: {user_message}\n\n"
+                "Return a concise explanation of what was decided, who decided, and rationale."
+            )
         else:
-            prompt = f"""
-            Based on the meeting transcript analysis, where:
-            - Summary: {self.current_analysis['summary']}
-            - Action Items: {self.current_analysis['action_items']}
-            - Meeting Requests: {self.current_analysis['meeting_requests']}
-            - Key Decisions: {self.current_analysis['key_decisions']}
+            prompt = (
+                "Based on the following analysis, answer the user question concisely.\n\n"
+                f"Summary: {json.dumps(context['summary'])}\n"
+                f"Action Items: {json.dumps(context['action_items'])}\n"
+                f"Meeting Requests: {json.dumps(context['meeting_requests'])}\n"
+                f"Key Decisions: {json.dumps(context['key_decisions'])}\n\n"
+                f"User question: {user_message}\n\nRespond concisely."
+            )
 
-            User Question: {user_message}
-
-            Provide a helpful and relevant response using the information from the transcript analysis.
-            If the user asks about something not covered in the transcript, politely indicate that.
-            Format the response in a clear, conversational way.
-            
-            If your response involves actionable items, suggest relevant next steps (like scheduling meetings or creating Notion pages).
-            """
-
-        response = self.model.generate_content(prompt)
-        return response.text
+        raw = self._call_model(prompt)
+        # If model returned JSON, prefer extracting plain text; otherwise return raw
+        if not raw:
+            return "Model did not return a response. Check API key, quota, or model availability."
+        return raw.strip()
 
     def clear_conversation(self):
-        """Clear the conversation history."""
         self.messages = []
         self.current_transcript = None
         self.current_analysis = None
