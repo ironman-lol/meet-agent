@@ -1,7 +1,12 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 from typing import Optional, Dict
 import json
+
+from src.utils.chat_handler import ChatHandler
 
 from src.models.gemini_transcript_processor import GeminiTranscriptProcessor
 from src.integrations.calendar_integration import CalendarIntegration
@@ -24,12 +29,36 @@ app.add_middleware(
 )
 
 # Initialize services
-transcript_processor = GeminiTranscriptProcessor()
+chat_handler = ChatHandler()
 calendar_integration = CalendarIntegration()
 notion_integration = NotionIntegration()
 
+# Set up templates
+templates = Jinja2Templates(directory="src/templates")
+
+@app.get("/")
+async def root(request: Request):
+    """Render the chat interface."""
+    return templates.TemplateResponse(
+        "chat.html",
+        {
+            "request": request, 
+            "messages": chat_handler.get_messages(),
+            "has_transcript": True  # Always true since we're using the sample
+        }
+    )
+
+@app.post("/chat")
+async def chat(request: Request, message: str = Form(...)):
+    """Handle chat messages."""
+    chat_handler.add_message(message, role="user")
+    response = await chat_handler.get_response(message)
+    chat_handler.add_message(response, role="assistant")
+    return RedirectResponse(url="/", status_code=303)
+
 @app.post("/process-transcript")
 async def process_transcript(
+    request: Request,
     transcript: UploadFile = File(...),
     settings: Settings = Depends(get_settings)
 ):
@@ -40,8 +69,8 @@ async def process_transcript(
         content = await transcript.read()
         transcript_text = content.decode("utf-8")
         
-        # Process transcript
-        analysis = transcript_processor.process_transcript(transcript_text)
+        # Process transcript using chat handler
+        analysis = chat_handler.process_transcript(transcript_text)
         
         # Create Notion page with summary
         if settings.NOTION_TOKEN:
@@ -62,7 +91,7 @@ async def process_transcript(
                 )
                 meeting["suggested_times"] = suggested_times
         
-        return analysis
+        return RedirectResponse(url="/", status_code=303)
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

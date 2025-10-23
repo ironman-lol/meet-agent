@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meeting Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .chat-message {
+            padding: 1rem;
+            margin: 0.5rem 0;
+            border-radius: 0.5rem;
+        }
+        .user-message {
+            background-color: #e2e8f0;
+            margin-left: 2rem;
+        }
+        .assistant-message {
+            background-color: #f0fdf4;
+            margin-right: 2rem;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-3xl font-bold mb-8 text-center">Meeting Assistant</h1>
+        
+        <!-- Chat Interface -->
+        <div class="max-w-4xl mx-auto bg-white rounded-lg shadow-lg p-6">
+            <div id="chat-messages" class="mb-4 h-[500px] overflow-y-auto">
+                <!-- Messages will be displayed here -->
+                {% for message in messages %}
+                <div class="chat-message {{ 'user-message' if message.role == 'user' else 'assistant-message' }}">
+                    <p class="text-sm font-semibold">{{ message.role|title }}</p>
+                    <p>{{ message.content }}</p>
+                </div>
+                {% endfor %}
+            </div>
+            
+            <form id="chat-form" class="flex gap-4" method="POST" action="/chat">
+                <input type="text" 
+                       name="message" 
+                       class="flex-1 p-2 border rounded-lg"
+                       placeholder="Type your message..."
+                       required>
+                <button type="submit" 
+                        class="bg-blue-500 text-white px-4 py-2 rounded-lg hover:bg-blue-600">
+                    Send
+                </button>
+            </form>
+
+            <!-- Hidden by default since we're using sample transcript -->
+            {% if not has_transcript %}
+            <div class="mt-8 border-t pt-4">
+                <h2 class="text-xl font-semibold mb-4">Process Transcript</h2>
+                <form action="/process-transcript" method="POST" enctype="multipart/form-data">
+                    <div class="flex gap-4">
+                        <input type="file" 
+                               name="transcript" 
+                               class="flex-1 p-2 border rounded-lg"
+                               accept=".txt"
+                               required>
+                        <button type="submit" 
+                                class="bg-green-500 text-white px-4 py-2 rounded-lg hover:bg-green-600">
+                            Process
+                        </button>
+                    </div>
+                </form>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <script>
+        // Scroll to bottom of chat messages
+        const chatMessages = document.getElementById('chat-messages');
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+        
+        // Auto-submit form when file is selected
+        const fileInput = document.querySelector('input[type="file"]');
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length > 0) {
+                fileInput.form.submit();
+            }
+        });
+    </script>
+</body>
+</html>

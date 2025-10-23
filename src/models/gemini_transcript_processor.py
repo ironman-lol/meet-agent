@@ -3,14 +3,131 @@ from datetime import datetime
 from typing import Dict, List
 import re
 import json
+import os
 from src.utils.config import get_settings
 
 settings = get_settings()
 
 class GeminiTranscriptProcessor:
     def __init__(self):
-        genai.configure(api_key=settings.GOOGLE_API_KEY)
-        self.model = genai.GenerativeModel('gemini-pro')
+        # Check for API key
+        api_key = settings.GOOGLE_API_KEY
+        if not api_key or api_key == "your_google_api_key_here":
+            raise ValueError("Please set a valid Google API key in the .env file")
+            
+        genai.configure(api_key=api_key)
+
+        # Check for manually specified model
+        selected_model = os.getenv("SELECTED_MODEL")
+        if selected_model:
+            print(f"Using manually specified model: {selected_model}")
+            self.model = genai.GenerativeModel(selected_model)
+            return
+
+        # List and analyze available models
+        available_models = list(genai.list_models())  # Convert generator to list
+        print("Available models count:", len(available_models))
+
+        def is_text_gen_model(m):
+            # get supported_generation_methods field (exists on Model)
+            methods = None
+            try:
+                methods = getattr(m, "supported_generation_methods", None)
+                if methods is None and isinstance(m, dict):
+                    methods = m.get("supported_generation_methods")
+            except Exception:
+                methods = None
+
+            # normalize to list of lowercase strings
+            if not methods:
+                return False
+            methods_lc = [str(x).lower() for x in methods]
+
+            # exclude embed-only / image-only / predict-only markers
+            if any(x in methods_lc for x in ("embedcontent","embed","predict")):
+                return False
+
+            # accept if it supports any known generation method
+            accept_markers = ("generatecontent", "bidigeneratecontent", "createcachedcontent", "batchgeneratecontent", "generateanswer")
+            return any(mk in methods_lc for mk in accept_markers)
+
+        # collect candidates and ensure we have a list
+        try:
+            text_models = [m for m in available_models if is_text_gen_model(m)]
+        except TypeError:  # If available_models is still a generator somehow
+            available_models = list(available_models)
+            text_models = [m for m in available_models if is_text_gen_model(m)]
+
+        if not text_models:
+            # dump signatures for debugging
+            print("\nDumping all available models for debugging:")
+            for m in available_models:
+                try:
+                    sig = {
+                        "name": getattr(m, "name", None),
+                        "display_name": getattr(m, "display_name", None),
+                        "supported_generation_methods": getattr(m, "supported_generation_methods", None)
+                    }
+                    print(f"MODEL SIGNATURE: {sig}")
+                    print(f"Raw supported_generation_methods: {getattr(m, 'supported_generation_methods', None)}")
+                except Exception as e:
+                    print(f"MODEL RAW ({type(m)}): {repr(m)}")
+                    print(f"Error getting signature: {str(e)}")
+            raise RuntimeError("No text generation models found. See signatures above.")
+
+        # prefer Gemini by name, else pick first
+        def name_of(m):
+            return getattr(m, "name", None) or (m.get("name") if isinstance(m, dict) else None)
+
+        gemini = [m for m in text_models if "gemini" in (name_of(m) or "").lower()]
+        chosen = gemini[0] if gemini else text_models[0]
+        model_name = name_of(chosen)
+        print("Selected model:", model_name)
+
+        # instantiate generative model (use name/id as SDK expects)
+        self.model = genai.GenerativeModel(model_name)
+
+        # conservative verification: try multiple call patterns
+        test_prompt = "Say: hello"
+        test_response = None
+        errors = []
+
+        # try model.generate_content (SDK usually exposes snake_case)
+        try:
+            fn = getattr(self.model, "generate_content", None)
+            if callable(fn):
+                test_response = fn(test_prompt)
+        except Exception as e:
+            errors.append(("generate_content", str(e)))
+
+        # try bidiGenerate variant if available on model (some models are bidi)
+        if not test_response:
+            try:
+                fn = getattr(self.model, "bidi_generate_content", None) or getattr(self.model, "bidiGenerateContent", None)
+                if callable(fn):
+                    test_response = fn(test_prompt)
+            except Exception as e:
+                errors.append(("bidi_generate", str(e)))
+
+        # try top-level helper if present (alternative SDK helper)
+        if not test_response:
+            try:
+                # genai.generate_text signature may vary; adapt if your SDK exposes it
+                if hasattr(genai, "generate_text"):
+                    test_response = genai.generate_text(model=model_name, input=test_prompt)
+            except Exception as e:
+                errors.append(("genai.generate_text", str(e)))
+
+        # validate shape
+        if not test_response:
+            print("Model verification failed. Attempted calls:", errors)
+            raise RuntimeError("Model verification failed; check SDK method names and that the API key has text-gen access.")
+
+        # if response object uses .text or content field, adapt when parsing later
+        print("Model verification succeeded. Response repr:", repr(test_response))
+        
+        # Model initialization is handled in the try-except block above
+            
         self.time_pattern = r'\[(\d{2}:\d{2}:\d{2})\]'
         self.speaker_pattern = r'\[(.*?)\].*?:(.*)'
 
@@ -44,27 +161,35 @@ class GeminiTranscriptProcessor:
             if not line.strip():
                 continue
                 
-            time_match = re.search(self.time_pattern, line)
-            speaker_match = re.search(self.speaker_pattern, line)
-            
-            if time_match and speaker_match:
-                timestamp = time_match.group(1)
-                speaker = speaker_match.group(1).split(']')[1].strip()
-                content = speaker_match.group(2).strip()
+            # Extract timestamp - pattern: [HH:MM:SS]
+            time_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+            if not time_match:
+                continue
                 
-                messages.append({
-                    "timestamp": timestamp,
-                    "speaker": speaker,
-                    "content": content
-                })
+            timestamp = time_match.group(1)
+            
+            # Remove timestamp from line and extract speaker and content
+            remaining_text = line[line.find(']') + 1:].strip()
+            if ':' not in remaining_text:
+                continue
+                
+            speaker, content = remaining_text.split(':', 1)
+            
+            messages.append({
+                "timestamp": timestamp,
+                "speaker": speaker.strip(),
+                "content": content.strip()
+            })
         
         return messages
 
     def generate_summary(self, messages: List[Dict]) -> Dict:
         """
-        Generate an AI-powered summary of the meeting using Gemini.
+        Generate an AI-powered summary of the meeting.
         """
+        print("Generating meeting summary...")
         conversation = "\n".join([f"{msg['speaker']}: {msg['content']}" for msg in messages])
+        print(f"Prepared conversation text: {len(conversation)} characters")
         
         prompt = """
         Analyze the following meeting transcript and provide:
