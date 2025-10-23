@@ -1,0 +1,283 @@
+[00:00:03] Rahul: Alright, let’s come to order. The objective today is to align the system architecture for our AI product suite — primarily focusing on inference pipeline optimization, multi-model orchestration, and deployment workflows. We’ve seen latency creep beyond acceptable limits, and before we scale, we need absolute clarity on architecture and responsibilities.
+
+[00:00:45] Aditi: Exactly. From the product side, our enterprise clients have started demanding custom fine-tuning endpoints. That changes how we handle model versioning and GPU allocation. The previous single-model assumption won’t hold.
+
+[00:01:10] Rohan: Right now, every fine-tuned instance spawns its own container with duplicated dependencies. That’s killing GPU memory utilization. We’re averaging only 32% GPU occupancy during peak load. The orchestration layer is over-isolated.
+
+[00:01:35] Neha: The ML Ops pipeline isn’t leveraging shared checkpoints efficiently. Each container loads the full model weights even if 95% are identical. If we switch to a base-weight plus delta architecture — like LoRA adaptation layers mounted dynamically — we can reduce overhead by roughly 60%.
+
+[00:02:00] Rahul: Good point. But we’ll need dynamic model loaders capable of diff merging on the fly. Does our current inference server support that?
+
+[00:02:14] Rohan: Not yet. Triton Inference Server supports it partially, but we’re still using a custom FastAPI wrapper for serving. I propose migrating heavy models to Triton, retaining FastAPI only as a thin API gateway.
+
+[00:02:34] Ankit: That’ll help with observability too. Triton integrates with Prometheus natively. We can push GPU utilization metrics without custom exporters. It also aligns with our plan to shift monitoring under Grafana Cloud.
+
+[00:02:55] Rahul: Okay, note that as a decision candidate.
+Neha, how does this impact our continuous training setup?
+
+[00:03:07] Neha: Minimal. Training is isolated in the internal cluster. The new setup affects only the inference nodes. I’ll have to rebuild deployment scripts to parameterize the adapter weights path. Otherwise, the retraining jobs remain untouched.
+
+[00:03:25] Aditi: What about latency numbers? The client demo last week saw 1.8s median response time. That’s too high for production.
+
+[00:03:39] Rohan: Yeah, because the model reloads between requests in multi-instance mode. Once we switch to persistent model residency, we’ll cut that down to 600ms median. If we add the Redis cache for embeddings, we can shave another 100ms.
+
+[00:03:59] Rahul: Sub-700ms is acceptable for the enterprise tier. The free tier can tolerate 1s. Let’s anchor that as the latency target.
+
+[00:04:12] Priya: From the UX side, even 900ms feels instant if animations are timed right. We can use skeleton loaders and subtle transitions to mask delay perception. We’ve done that in previous dashboards successfully.
+
+[00:04:35] Rahul: Fine. That’s secondary. Focus now on core throughput. Vikram, what’s the latest on model ensemble testing?
+
+[00:04:48] Vikram: We ran comparative benchmarks with four models: Falcon-7B, Mistral, Llama 3, and our internal fine-tuned variant. The hybrid ensemble where routing happens via vector similarity scored best — 3.2% higher factual accuracy and 11% reduction in hallucination rate.
+
+[00:05:12] Aditi: But that’s computationally heavier.
+
+[00:05:16] Vikram: Yes, 1.6x cost overhead. But if we push the ensemble routing to CPU-level preselection and let only the top two candidates hit the GPU, cost normalizes. We need a routing policy engine for that — something configurable.
+
+[00:05:39] Rohan: That means building a lightweight router microservice. We can reuse the semantic search module — it already computes cosine similarity between queries and model embedding fingerprints.
+
+[00:05:55] Rahul: Do it. Prioritize modularity. The system must allow adding or retiring models without touching the gateway logic.
+Aditi, mark this as a core architectural requirement.
+
+[00:06:12] Aditi: Done. Moving on — we need to finalize versioning and rollback strategy. Last month’s deployment regression highlighted that our current Git tag-based versioning isn’t safe enough.
+
+[00:06:30] Neha: Agreed. The pipeline deploys directly from main branch merges. We need immutable model artifact tracking — possibly using MLflow or Weights & Biases with version pinning.
+
+[00:06:48] Ankit: I recommend we standardize artifact management on MLflow. It integrates with S3, and we can map every deployed model to its Docker image hash and environment config. That makes rollback deterministic.
+
+[00:07:09] Rahul: Then implement that before the next sprint ends.
+Meera, ensure the security audit checklist covers artifact provenance verification. No unsigned artifacts in production.
+
+[00:07:26] Meera: Already noted. I’ll also add checksum verification during deployment.
+
+[00:07:34] Aditi: Good. Next — multi-region deployment. Clients in Singapore and Frankfurt are reporting latency spikes beyond 2s.
+
+[00:07:47] Ankit: That’s expected; both regions are currently routed to Mumbai. We need regional edge deployments with model replicas. I propose using AWS EKS clusters with autoscaling groups. Data locality should reduce network latency by 40%.
+
+[00:08:10] Rohan: We’ll need automated model syncing across clusters. I’ll write a replication daemon to pull from the central S3 bucket. Sync frequency can be set via config maps.
+
+[00:08:26] Rahul: Fine. Just ensure no partial syncs go live. Use checksum validation before switching traffic.
+
+[00:08:40] Priya: On a different note, the internal feedback on the AI assistant UI has been positive, but people found the context switching between chat and document mode confusing.
+
+[00:08:55] Aditi: That came up in user interviews too. They want unified context persistence — the system should remember what they uploaded even if they move back to chat mode.
+
+[00:09:10] Rohan: We can solve that by linking conversation sessions with document embeddings through UUID-based keys. That way, each chat thread automatically references uploaded content until expiry.
+
+[00:09:30] Priya: That’ll fix the flow. I’ll update the interface to show a persistent document badge when the chat is linked.
+
+[00:09:42] Rahul: Alright. UX changes are fine, but ensure no memory leaks from session persistence.
+
+[00:09:52] Rohan: I’ll garbage-collect expired sessions nightly. We can store active sessions in Redis with TTLs.
+
+[00:10:07] Neha: Can I raise one issue? The model retraining jobs are clogging GPU queues during work hours. We need a scheduling policy.
+
+[00:10:20] Ankit: I can set Kubernetes node taints for training pods so they only occupy low-priority GPUs after midnight. That’ll free up compute for inference during the day.
+
+[00:10:38] Rahul: Do it. Operational efficiency first.
+
+[00:10:50] Aditi: Next agenda — data governance. We’ve onboarded three new enterprise datasets last week. Are they compliant with our anonymization standard?
+
+[00:11:03] Neha: Two of them are clean. The third — the healthcare one — still contains embedded PII inside text notes. I’m running a scrubber using regex plus NER-based masking, but recall isn’t perfect yet.
+
+[00:11:23] Rahul: What’s the precision-recall tradeoff?
+
+[00:11:27] Neha: About 96% precision, 87% recall.
+
+[00:11:34] Rahul: Improve recall above 93%. False negatives here are unacceptable.
+
+[00:11:42] Neha: I’ll retrain the detection pipeline with additional labeled examples.
+
+[00:11:55] Vikram: Quick note — for our AI summarization module, I’ve benchmarked extractive vs abstractive performance. Abstractive summaries perform better on coherence but hallucinate factual data in 14% of cases.
+
+[00:12:12] Aditi: Can we hybridize?
+
+[00:12:15] Vikram: Yes, use extractive core with generative rephrasing. That maintains truthfulness while improving readability.
+
+[00:12:28] Rahul: Implement that approach. Optimize for factuality first, fluency second.
+
+[00:12:38] Priya: In the interface, we can label “factual mode” vs “creative mode.” That gives users explicit control.
+
+[00:12:49] Rahul: Fine. Keep UI terms precise, not marketing-heavy.
+[00:13:01] Rahul: Before we proceed, I want to emphasize one principle — scalability before features. We’ve added too many endpoints without verifying horizontal elasticity. Let’s fix the foundation first.
+
+[00:13:20] Rohan: Agreed. Our load testing last week capped at 1,500 concurrent requests. The CPU throttled even before GPU saturation. The gateway’s async pool exhausted itself.
+
+[00:13:36] Neha: That’s because the event loop in FastAPI is handling too many I/O waits. If we introduce a message queue, say RabbitMQ or Kafka, we can decouple requests from execution.
+
+[00:13:50] Rahul: Kafka. RabbitMQ won’t scale at our ingestion rate. Kafka partitions give us resilience. Implement a producer-consumer model — API gateway as producer, inference workers as consumers.
+
+[00:14:09] Ankit: That’ll add 200ms overhead but drastically stabilize throughput.
+
+[00:14:18] Rahul: Acceptable. Prioritize reliability over short-term speed.
+
+[00:14:26] Aditi: Then our new architecture stack looks like this: user → gateway (FastAPI) → Kafka → Triton inference workers → Redis cache → response → user.
+
+[00:14:44] Rohan: Correct. Plus Prometheus for metrics and Loki for logs.
+
+[00:14:52] Rahul: Perfect. Every component must expose a health endpoint. We’ll automate health checks in the load balancer.
+
+[00:15:04] Ankit: I’ll configure Kubernetes liveness and readiness probes. Fail-fast approach.
+
+[00:15:15] Priya: Question on latency perception. For real-time chat scenarios, can we stream partial responses rather than waiting for full completion?
+
+[00:15:28] Rohan: Possible. HTTP/2 with server-sent events or WebSockets. SSE is simpler and fits current infra.
+
+[00:15:40] Rahul: Implement SSE for the enterprise dashboard by default. WebSocket later if needed.
+
+[00:15:51] Priya: Got it. That’ll improve perceived responsiveness significantly.
+
+[00:16:03] Aditi: Coming to model management — version retention. How many model versions do we plan to keep live simultaneously?
+
+[00:16:15] Rohan: Three active, two archived. Anything older than that gets pruned from deployment, retained in cold storage.
+
+[00:16:28] Rahul: Fine. Keep metadata but offload weights.
+
+[00:16:37] Neha: I’ll automate model lifecycle cleanup weekly.
+
+[00:16:45] Vikram: On data ingestion, we’re hitting schema drift in enterprise logs. JSON structure varies per client. We need schema inference and normalization before feeding training pipelines.
+
+[00:16:59] Rohan: Use Pydantic for schema validation and Arrow for columnar conversion. That gives us speed and consistency.
+
+[00:17:12] Rahul: Implement schema validation early. Garbage in, garbage out applies doubly here.
+
+[00:17:25] Meera: Quick compliance update. With the EU client onboard, we must ensure GDPR-compliant deletion. The “right to forget” workflow needs automation.
+
+[00:17:40] Neha: We can tag user embeddings and logs with UUIDs. If deletion is requested, we trace and remove all associated vectors and records.
+
+[00:17:55] Ankit: That needs audit logging. I’ll ensure all deletions get soft-logged with irreversible markers.
+
+[00:18:09] Rahul: Do that. Compliance isn’t negotiable.
+
+[00:18:18] Aditi: Moving to timeline. Beta 2 release is scheduled for November 5. Are we confident with that?
+
+[00:18:28] Rohan: Engineering side — 70% complete. The remaining is routing layer and caching integration.
+
+[00:18:40] Priya: Design — 80% done. We’re adding dark mode and adaptive layouts this week.
+
+[00:18:52] Neha: ML Ops — model management scripts are stable. Metrics dashboard pending.
+
+[00:19:05] Rahul: Keep November 5 as soft freeze. Final freeze November 10. Launch readiness November 20.
+
+[00:19:18] Vikram: Regarding model bias testing — early audits found mild gender bias in summarization outputs. We need mitigation.
+
+[00:19:30] Neha: That stems from pretraining corpus imbalance. We can use re-ranking postprocessors with fairness scoring.
+
+[00:19:44] Rahul: Build it modular. A fairness filter module that can attach to any output pipeline.
+
+[00:19:56] Aditi: Document it as part of responsible AI policy. Clients will ask.
+
+[00:20:05] Meera: I’ll include bias audit logs under compliance reports.
+
+[00:20:18] Rohan: Next, vector database decision. We’re still split between Pinecone, Weaviate, and Qdrant.
+
+[00:20:29] Neha: Qdrant has self-hosting flexibility. Pinecone scales easier but costs more.
+
+[00:20:41] Ankit: Weaviate integrates best with our Kubernetes setup.
+
+[00:20:51] Rahul: Choose Qdrant. Control trumps convenience. Cost and data sovereignty justify it.
+
+[00:21:05] Aditi: Regarding client onboarding, we’ll need tenant isolation at data and compute layers.
+
+[00:21:17] Rohan: Multi-tenant architecture with namespace-level isolation. Each client runs within its namespace, sharing core infra.
+
+[00:21:29] Ankit: I’ll implement network policies to block cross-namespace data flow.
+
+[00:21:39] Rahul: Good. Security by default.
+
+[00:21:49] Priya: Feedback request — users want offline report exports. Should we allow direct CSV download or restrict it to scheduled email reports?
+
+[00:22:04] Aditi: Scheduled emails are safer. Prevents raw data leaks.
+
+[00:22:14] Meera: Add watermarking to every exported file with tenant ID.
+
+[00:22:25] Rahul: Make it automatic.
+
+[00:22:33] Vikram: Update on analytics pipeline — ingestion at 40GB/day. Post-compression, 8GB stored. We can hold 90 days of logs in cold tier before rotation.
+
+[00:22:49] Ankit: That’s manageable. Glacier deep archive for anything older.
+
+[00:22:59] Rahul: Set retention policy to 180 days. Longer for premium clients.
+
+[00:23:10] Aditi: Any blockers?
+
+[00:23:14] Rohan: Waiting for AWS service quota increase for GPUs.
+
+[00:23:22] Ankit: Submitted yesterday. ETA two days.
+
+[00:23:28] Rahul: Fine. Continue testing locally.
+
+[00:23:37] Neha: About continuous deployment — can we include model performance validation as a pipeline gate?
+
+[00:23:50] Rohan: Yes, run validation script comparing F1, accuracy, and latency metrics before promotion to production.
+
+[00:24:05] Rahul: Mandatory. Every model build must prove improvement or parity.
+
+[00:24:17] Aditi: Next point — cost forecasting. GPU utilization, inference costs, and storage.
+
+[00:24:29] Neha: We’re at ₹3.2 lakh monthly burn on GPU compute. After caching, projection drops to ₹2.1 lakh.
+
+[00:24:42] Rahul: Keep below ₹2.5 lakh.
+
+[00:24:49] Ankit: We’ll use spot instances for non-critical jobs.
+
+[00:24:57] Rahul: Approved.
+
+[00:25:05] Priya: A quick user feedback note. The onboarding tutorial videos are outdated.
+
+[00:25:16] Aditi: Re-record after the UI freeze, November 10.
+
+[00:25:23] Priya: Understood.
+
+[00:25:30] Rahul: Let’s talk observability stack. Metrics, tracing, logging.
+
+[00:25:39] Rohan: Prometheus for metrics, Grafana for visualization, Loki for logs, Jaeger for tracing.
+
+[00:25:51] Ankit: I’ll unify traces across microservices via OpenTelemetry.
+
+[00:26:02] Rahul: Ensure full correlation from API request to GPU execution.
+
+[00:26:14] Aditi: Product integration question. Some clients want Slack integration for summarization and insights delivery.
+
+[00:26:27] Rohan: That’s just webhook endpoints. Low lift.
+
+[00:26:35] Rahul: Ship it only after core system stabilizes. No distractions.
+
+[00:26:45] Neha: Reporting bug — model metrics dashboard sometimes reports duplicate entries.
+
+[00:26:55] Rohan: That’s due to concurrent writes from two collectors. I’ll introduce distributed locks.
+
+[00:27:07] Rahul: Fix before Friday.
+
+[00:27:15] Aditi: We’re halfway through the agenda. Next — post-launch monitoring.
+
+[00:27:26] Neha: KPIs: latency below 700ms, uptime 99.95%, mean error rate <0.5%, retrain cycle biweekly.
+
+[00:27:40] Rahul: Add carbon footprint metric — energy per inference. Clients will ask soon.
+
+[00:27:51] Ankit: I’ll pull GPU power metrics into Prometheus.
+
+[00:27:59] Rahul: Do it.
+
+[00:28:07] Vikram: Research update — experimenting with retrieval-augmented generation (RAG) over hybrid index. Results are promising.
+
+[00:28:20] Rohan: Latency impact?
+
+[00:28:23] Vikram: Around +150ms but 22% accuracy gain.
+
+[00:28:31] Rahul: Acceptable. Continue testing.
+
+[00:28:40] Aditi: Shall we set a review meeting for the RAG module separately?
+
+[00:28:47] Rahul: Yes, next Tuesday.
+
+[00:28:55] Priya: Visual hierarchy for the analytics dashboard — should “AI Insights” appear before “Manual Reports”?
+
+[00:29:07] Aditi: Yes, prioritize AI-driven sections.
+
+[00:29:14] Rahul: But clearly mark it “Beta.” Avoid user confusion.
+
+[00:29:23] Meera: Small note — token storage in local storage is a vulnerability. Move to secure HTTP-only cookies.
+
+[00:29:35] Rohan: Done. Will patch tomorrow.
+
+[00:29:42] Rahul: Thank you.

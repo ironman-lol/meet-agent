@@ -1,0 +1,17 @@
+[00:00:00] Meeting Host: Welcome everyone to our project planning meeting.
+[00:00:15] John Smith: Thanks for organizing this. I have some updates on the frontend development.
+[00:00:30] Sarah Johnson: Before we start, can we schedule a design review for next Thursday at 2 PM?
+[00:00:45] Meeting Host: Good idea, Sarah. I'll note that down.
+[00:01:00] John Smith: Regarding the frontend, we've completed the user authentication module. We need to integrate it with the backend API.
+[00:01:30] Mike Davis: I can help with the API integration. Let's set up a quick sync tomorrow at 11 AM to discuss the details.
+[00:01:45] Sarah Johnson: Sounds good. I'll also share the updated design specs in Notion by end of day.
+[00:02:00] John Smith: Perfect. @Mike, I'll need your input on the error handling implementation.
+[00:02:15] Mike Davis: Sure, I'll review it and provide feedback by Friday.
+[00:02:30] Meeting Host: Great progress everyone. Let's summarize the action items:
+[00:02:45] Meeting Host: 1. Sarah - Schedule design review for Thursday 2 PM
+[00:03:00] Meeting Host: 2. Mike and John - Sync tomorrow at 11 AM for API integration
+[00:03:15] Meeting Host: 3. Sarah - Share design specs in Notion today
+[00:03:30] Meeting Host: 4. Mike - Review error handling by Friday
+[00:03:45] Meeting Host: Any other points to discuss?
+[00:04:00] Sarah Johnson: No, I think we covered everything.
+[00:04:15] Meeting Host: Perfect, thanks everyone!
